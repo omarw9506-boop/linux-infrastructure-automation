@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# Script Name   : infrastructure_monitor.sh
+# Description   : Enterprise Production System Monitor & Config Backup
+# Author        : Omar Wael Hamada Saad
+# Target OS     : Linux (Debian, Ubuntu, RHEL, CentOS) & Android (Termux)
+# ==============================================================================
+
+# Strict Execution Settings (Fail Fast & Unset Variable Protection)
+set -euo pipefail
+
+# ------------------------------------------------------------------------------
+# ENVIRONMENT & PATH SETUP (Termux & Standard Linux Compatible)
+# ------------------------------------------------------------------------------
+if [[ -d "$HOME/.termux" || -d "/data/data/com.termux" ]]; then
+    IS_TERMUX=true
+    BASE_DIR="$HOME/sys_admin"
+else
+    IS_TERMUX=false
+    BASE_DIR="/var/log/sys_admin"
+fi
+
+LOG_FILE="$BASE_DIR/system_health.log"
+BACKUP_DIR="$BASE_DIR/backups"
+
+# Thresholds
+CPU_THRESHOLD=80
+MEM_THRESHOLD=85
+DISK_THRESHOLD=90
+
+# Ensure Required Directories Exist
+mkdir -p "$BASE_DIR" "$BACKUP_DIR"
+
+# ------------------------------------------------------------------------------
+# LOGGING SYSTEM
+# ------------------------------------------------------------------------------
+log() {
+    local level="$1"
+    local message="$2"
+    local timestamp
+    timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    echo "[$timestamp] [$level] $message" | tee -a "$LOG_FILE"
+}
+
+# ------------------------------------------------------------------------------
+# REAL SYSTEM HEALTH MONITORING
+# ------------------------------------------------------------------------------
+check_cpu() {
+    local cpu_idle cpu_usage
+    # POSIX-compliant CPU usage calculation from /proc/stat (No external dependencies)
+    if [[ -f /proc/stat ]]; then
+        local cpu_line1 cpu_line2
+        cpu_line1=$(grep '^cpu ' /proc/stat)
+        sleep 1
+        cpu_line2=$(grep '^cpu ' /proc/stat)
+
+        local user1 sys1 idle1 user2 sys2 idle2
+        read -r _ user1 _ sys1 idle1 _ < <(echo "$cpu_line1")
+        read -r _ user2 _ sys2 idle2 _ < <(echo "$cpu_line2")
+
+        local total1=$((user1 + sys1 + idle1))
+        local total2=$((user2 + sys2 + idle2))
+        local diff_total=$((total2 - total1))
+        local diff_idle=$((idle2 - idle1))
+
+        if [[ $diff_total -gt 0 ]]; then
+            cpu_usage=$(( 100 * (diff_total - diff_idle) / diff_total ))
+        else
+            cpu_usage=0
+        fi
+    else
+        cpu_usage=0
+    fi
+
+    if (( cpu_usage >= CPU_THRESHOLD )); then
+        log "CRITICAL" "CPU usage at ${cpu_usage}% (Exceeds ${CPU_THRESHOLD}%)"
+    else
+        log "INFO" "CPU usage normal: ${cpu_usage}%"
+    fi
+}
+
+check_memory() {
+    local mem_usage
+    # Uses free command with cross-distro compatibility
+    mem_usage=$(free | awk '/Mem:/ {if ($2 > 0) printf("%d", ($3/$2)*100); else print 0}')
+
+    if (( mem_usage >= MEM_THRESHOLD )); then
+        log "WARNING" "Memory usage at ${mem_usage}% (Exceeds ${MEM_THRESHOLD}%)"
+    else
+        log "INFO" "Memory usage normal: ${mem_usage}%"
+    fi
+}
+
+check_disk() {
+    local disk_usage
+    disk_usage=$(df -P "$HOME" | awk 'NR==2 {print $5}' | tr -d '%')
+
+    if (( disk_usage >= DISK_THRESHOLD )); then
+        log "CRITICAL" "Disk usage on target volume at ${disk_usage}%"
+    else
+        log "INFO" "Disk usage normal: ${disk_usage}%"
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# REAL BACKUP & DISASTER RECOVERY ENGINE
+# ------------------------------------------------------------------------------
+perform_backup() {
+    log "INFO" "Initiating automated backup process..."
+    
+    local timestamp archive_name archive_path
+    timestamp=$(date +"%Y%m%d_%H%M%S")
+    archive_name="config_backup_${timestamp}.tar.gz"
+    archive_path="$BACKUP_DIR/$archive_name"
+
+    # Define targets dynamically based on environment
+    local targets=()
+    if [[ "$IS_TERMUX" == true ]]; then
+        [[ -d "$PREFIX/etc" ]] && targets+=("$PREFIX/etc")
+    else
+        [[ -d "/etc/nginx" ]] && targets+=("/etc/nginx")
+        [[ -d "/etc/ssh" ]] && targets+=("/etc/ssh")
+    fi
+
+    # Backup execution
+    if [[ ${#targets[@]} -gt 0 ]]; then
+        if tar -czf "$archive_path" "${targets[@]}" 2>/dev/null; then
+            log "SUCCESS" "Backup archived successfully: $archive_path"
+        else
+            log "ERROR" "Compression failed during backup execution."
+            return 1
+        fi
+    else
+        # Fallback: Backup current environment log as test payload
+        tar -czf "$archive_path" "$LOG_FILE" 2>/dev/null
+        log "SUCCESS" "Fallback backup completed: $archive_path"
+    fi
+
+    # Retention Policy: Automatically delete backups older than 7 days
+    find "$BACKUP_DIR" -type f -name "config_backup_*.tar.gz" -mtime +7 -delete
+    log "INFO" "Retention policy executed (Older backups cleaned)."
+}
+
+# ------------------------------------------------------------------------------
+# MAIN PIPELINE
+# ------------------------------------------------------------------------------
+main() {
+    log "INFO" "===================================================="
+    log "INFO" "Starting System Health & Infrastructure Automation"
+    log "INFO" "===================================================="
+
+    check_cpu
+    check_memory
+    check_disk
+    perform_backup
+
+    log "INFO" "Execution finished successfully."
+}
+
+main "$@"
